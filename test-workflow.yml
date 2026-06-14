@@ -1,0 +1,87 @@
+name: Tests & Benchmarks
+
+on:
+  push:
+    branches: [ main, perf/* ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.21', '1.22', '1.23', '1.24']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go-version }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Run unit tests
+      run: go test -v -race -timeout 10m ./internal/drift ./internal/state ./internal/store
+    
+    - name: Run benchmarks (small dataset)
+      run: |
+        go test -bench=BenchmarkCompareSmall -benchmem ./internal/drift
+        go test -bench=BenchmarkSaveScan -benchmem ./internal/store
+        go test -bench=BenchmarkNormalizeSmall -benchmem ./internal/state
+    
+    - name: Run benchmarks (large dataset)
+      run: |
+        go test -bench=BenchmarkCompareLarge -benchmem ./internal/drift
+        go test -bench=BenchmarkListScans -benchmem ./internal/store
+        go test -bench=BenchmarkNormalizeLarge -benchmem ./internal/state
+    
+    - name: Generate coverage report
+      run: |
+        go test -coverprofile=coverage.out ./internal/drift ./internal/state ./internal/store
+        go tool cover -func=coverage.out
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage.out
+        flags: unittests
+        name: codecov-umbrella
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24'
+    
+    - name: Install golangci-lint
+      run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+    
+    - name: Run linter
+      run: golangci-lint run ./...
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24'
+    
+    - name: Build
+      run: make build
