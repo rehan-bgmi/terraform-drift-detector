@@ -1,7 +1,6 @@
 package drift
 
 import (
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -35,33 +34,38 @@ func NewEngine(cfg model.CompareConfig) *Engine {
 
 // Compare produces a drift report from expected (state) and actual (cloud) resources.
 func (e *Engine) Compare(expected, actual []model.Resource) []model.DriftFinding {
-	actualIndex := make(map[string]model.Resource, len(actual))
-	for _, r := range actual {
-		actualIndex[r.ID] = r
+	// Optimization 4: Use pointers to avoid copying large resource structs
+	actualIndexByID := make(map[string]*model.Resource, len(actual))
+	for i := range actual {
+		actualIndexByID[actual[i].ID] = &actual[i]
 	}
 
-	expectedIndex := make(map[string]model.Resource, len(expected))
+	expectedIndexByID := make(map[string]*model.Resource, len(expected))
 	var findings []model.DriftFinding
 
-	for _, exp := range expected {
-		expectedIndex[exp.ID] = exp
-		act, ok := actualIndex[exp.ID]
+	// Check for missing resources and attribute/tag changes
+	for i := range expected {
+		exp := &expected[i]
+		expectedIndexByID[exp.ID] = exp
+		act, ok := actualIndexByID[exp.ID]
 		if !ok {
 			findings = append(findings, model.DriftFinding{
 				Kind:         model.DriftMissingInCloud,
 				ResourceID:   exp.ID,
 				ResourceType: exp.Type,
 				ResourceName: exp.Name,
-				Severity:     severityForMissing(exp),
+				Severity:     severityForMissing(*exp),
 			})
 			continue
 		}
-		findings = append(findings, e.diffAttributes(exp, act)...)
-		findings = append(findings, e.diffTags(exp, act)...)
+		findings = append(findings, e.diffAttributes(*exp, *act)...)
+		findings = append(findings, e.diffTags(*exp, *act)...)
 	}
 
-	for _, act := range actual {
-		if _, ok := expectedIndex[act.ID]; !ok {
+	// Check for extra resources
+	for i := range actual {
+		act := &actual[i]
+		if _, ok := expectedIndexByID[act.ID]; !ok {
 			findings = append(findings, model.DriftFinding{
 				Kind:         model.DriftExtraInCloud,
 				ResourceID:   act.ID,
@@ -91,7 +95,8 @@ func (e *Engine) diffAttributes(exp, act model.Resource) []model.DriftFinding {
 		}
 		ev := exp.Attributes[key]
 		av := act.Attributes[key]
-		if valuesEqual(ev, av) {
+		// Optimization 1: Direct value comparison instead of JSON serialization
+		if valuesEqualDirect(ev, av) {
 			continue
 		}
 		findings = append(findings, model.DriftFinding{
@@ -108,27 +113,52 @@ func (e *Engine) diffAttributes(exp, act model.Resource) []model.DriftFinding {
 	return findings
 }
 
+// Optimization 3: Single-pass tag comparison without intermediate maps
 func (e *Engine) diffTags(exp, act model.Resource) []model.DriftFinding {
 	var findings []model.DriftFinding
 
-	expTags := filterTags(exp.Tags, e.IgnoreTags)
-	actTags := filterTags(act.Tags, e.IgnoreTags)
-
-	allKeys := make(map[string]bool)
-	for k := range expTags {
-		allKeys[k] = true
-	}
-	for k := range actTags {
-		allKeys[k] = true
-	}
-
-	for key := range allKeys {
-		ev, eok := expTags[key]
-		av, aok := actTags[key]
-		if eok && aok && ev == av {
+	// Create filtered views without allocating new maps
+	for key, expVal := range exp.Tags {
+		if e.IgnoreTags[key] {
 			continue
 		}
-		if !eok && aok {
+		actVal, ok := act.Tags[key]
+		if !ok {
+			// Tag missing in actual
+			findings = append(findings, model.DriftFinding{
+				Kind:         model.DriftTagsChanged,
+				ResourceID:   exp.ID,
+				ResourceType: exp.Type,
+				ResourceName: exp.Name,
+				Field:        fmt.Sprintf("tags.%s", key),
+				Expected:     expVal,
+				Actual:       nil,
+				Severity:     model.SeverityInfo,
+			})
+			continue
+		}
+		if expVal != actVal {
+			// Tag value changed
+			findings = append(findings, model.DriftFinding{
+				Kind:         model.DriftTagsChanged,
+				ResourceID:   exp.ID,
+				ResourceType: exp.Type,
+				ResourceName: exp.Name,
+				Field:        fmt.Sprintf("tags.%s", key),
+				Expected:     expVal,
+				Actual:       actVal,
+				Severity:     model.SeverityInfo,
+			})
+		}
+	}
+
+	// Check for extra tags in actual
+	for key, actVal := range act.Tags {
+		if e.IgnoreTags[key] {
+			continue
+		}
+		if _, ok := exp.Tags[key]; !ok {
+			// Extra tag in actual
 			findings = append(findings, model.DriftFinding{
 				Kind:         model.DriftTagsChanged,
 				ResourceID:   exp.ID,
@@ -136,51 +166,18 @@ func (e *Engine) diffTags(exp, act model.Resource) []model.DriftFinding {
 				ResourceName: exp.Name,
 				Field:        fmt.Sprintf("tags.%s", key),
 				Expected:     nil,
-				Actual:       av,
-				Severity:     model.SeverityInfo,
-			})
-			continue
-		}
-		if eok && !aok {
-			findings = append(findings, model.DriftFinding{
-				Kind:         model.DriftTagsChanged,
-				ResourceID:   exp.ID,
-				ResourceType: exp.Type,
-				ResourceName: exp.Name,
-				Field:        fmt.Sprintf("tags.%s", key),
-				Expected:     ev,
-				Actual:       nil,
-				Severity:     model.SeverityInfo,
-			})
-			continue
-		}
-		if ev != av {
-			findings = append(findings, model.DriftFinding{
-				Kind:         model.DriftTagsChanged,
-				ResourceID:   exp.ID,
-				ResourceType: exp.Type,
-				ResourceName: exp.Name,
-				Field:        fmt.Sprintf("tags.%s", key),
-				Expected:     ev,
-				Actual:       av,
+				Actual:       actVal,
 				Severity:     model.SeverityInfo,
 			})
 		}
 	}
+
 	return findings
 }
 
-func filterTags(tags map[string]string, ignore map[string]bool) map[string]string {
-	out := make(map[string]string)
-	for k, v := range tags {
-		if !ignore[k] {
-			out[k] = v
-		}
-	}
-	return out
-}
-
-func valuesEqual(a, b any) bool {
+// Optimization 1: Direct value comparison without JSON serialization
+// Compares two values with normalization for numeric types and nested structures
+func valuesEqualDirect(a, b any) bool {
 	if a == nil && b == nil {
 		return true
 	}
@@ -188,11 +185,51 @@ func valuesEqual(a, b any) bool {
 		return false
 	}
 
-	// JSON round-trip normalizes numeric types and nested structures
-	aj, err1 := json.Marshal(normalizeForCompare(a))
-	bj, err2 := json.Marshal(normalizeForCompare(b))
-	if err1 == nil && err2 == nil {
-		return string(aj) == string(bj)
+	// Fast path for simple types
+	if av, ok := a.(string); ok {
+		if bv, ok := b.(string); ok {
+			return av == bv
+		}
+	}
+
+	// Normalize and compare complex types
+	return valuesEqualNormalized(normalizeForCompare(a), normalizeForCompare(b))
+}
+
+// Deep equality comparison for normalized values
+func valuesEqualNormalized(a, b any) bool {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for k, aval := range av {
+			bval, ok := bv[k]
+			if !ok || !valuesEqualNormalized(aval, bval) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !valuesEqualNormalized(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	case int64:
+		if bv, ok := b.(int64); ok {
+			return av == bv
+		}
+	case float64:
+		if bv, ok := b.(float64); ok {
+			return av == bv
+		}
 	}
 
 	return reflect.DeepEqual(a, b)

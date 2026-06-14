@@ -192,9 +192,10 @@ var terraformOnlyKeys = map[string]bool{
 	"owner_id": true, "requester_id": true,
 }
 
+// Optimization 6: Simplified normalization with in-place handling
 func normalizeAttributes(resType string, attrs map[string]any) map[string]any {
 	compareKeys := compareKeysForType(resType)
-	out := make(map[string]any)
+	out := make(map[string]any, len(compareKeys))
 
 	for _, key := range compareKeys {
 		if v, ok := attrs[key]; ok {
@@ -231,15 +232,22 @@ func attrsFromType(_ string) map[string]bool {
 	return map[string]bool{}
 }
 
+// Optimization 6: Recursive normalization - kept but optimized
 func normalizeValue(v any) any {
 	switch t := v.(type) {
 	case []any:
+		if len(t) == 0 {
+			return t // Return empty slice as-is
+		}
 		out := make([]any, len(t))
 		for i, item := range t {
 			out[i] = normalizeValue(item)
 		}
 		return out
 	case map[string]any:
+		if len(t) == 0 {
+			return t // Return empty map as-is
+		}
 		out := make(map[string]any, len(t))
 		for k, item := range t {
 			out[k] = normalizeValue(item)
